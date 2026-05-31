@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	vestaboard "github.com/kavfixnel/vestaboard-go"
 	"github.com/kavfixnel/vestaboard/mta"
 )
 
@@ -33,7 +34,13 @@ func runSend(args []string) {
 		os.Exit(1)
 	}
 
-	result, err := sendMessage(token, text, *forced)
+	client := vestaboard.NewClient(token)
+	var result *vestaboard.Message
+	if *forced {
+		result, err = client.WriteTextForced(text)
+	} else {
+		result, err = client.WriteText(text)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -82,12 +89,18 @@ func runLTrain(args []string) {
 			return nil
 		}
 
-		result, err := sendMessage(token, message, *forced)
+		client := vestaboard.NewClient(token)
+		var msg *vestaboard.Message
+		if *forced {
+			msg, err = client.WriteTextForced(message)
+		} else {
+			msg, err = client.WriteText(message)
+		}
 		if err != nil {
 			return err
 		}
 
-		fmt.Printf("sent message (id: %s)\n", result.ID)
+		fmt.Printf("sent message (id: %s)\n", msg.ID)
 		return nil
 	}
 
