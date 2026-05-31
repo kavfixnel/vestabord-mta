@@ -1,111 +1,33 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
+
+	"github.com/kavfixnel/vestaboard/mta"
 )
 
-const apiURL = "https://cloud.vestaboard.com/"
-
-type sendRequest struct {
-	Text   string `json:"text"`
-	Forced bool   `json:"forced,omitempty"`
-}
-
-type sendResponse struct {
-	Status  string `json:"status"`
-	ID      string `json:"id"`
-	Created int64  `json:"created"`
-	Error   string `json:"error"`
-}
-
-func loadToken(path string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", fmt.Errorf("read %s: %w", path, err)
-	}
-
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-
-		if strings.TrimSpace(key) == "VESTABORD_TOKEN" {
-			value = strings.TrimSpace(value)
-			value = strings.Trim(value, `"'`)
-			if value == "" {
-				return "", fmt.Errorf("VESTABORD_TOKEN is empty in %s", path)
-			}
-			return value, nil
-		}
-	}
-
-	return "", fmt.Errorf("VESTABORD_TOKEN not found in %s", path)
-}
-
-func sendMessage(token, text string, forced bool) (*sendResponse, error) {
-	body, err := json.Marshal(sendRequest{Text: text, Forced: forced})
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest(http.MethodPost, apiURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Vestaboard-Token", token)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var result sendResponse
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("decode response: %w (body: %s)", err, string(respBody))
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if result.Error != "" {
-			return nil, fmt.Errorf("api error (%d): %s", resp.StatusCode, result.Error)
-		}
-		return nil, fmt.Errorf("api error (%d): %s", resp.StatusCode, string(respBody))
-	}
-
-	return &result, nil
-}
-
-func main() {
-	envPath := flag.String("env", ".env", "path to .env file")
-	forced := flag.Bool("forced", false, "send even during quiet hours")
-	flag.Parse()
-
-	text := strings.TrimSpace(strings.Join(flag.Args(), " "))
-	if text == "" {
-		fmt.Fprintln(os.Stderr, "usage: vestaboard [-env .env] [-forced] <message>")
+func runSend(args []string) {
+	fs := flag.NewFlagSet("send", flag.ExitOnError)
+	envPath := fs.String("env", ".env", "path to .env file")
+	forced := fs.Bool("forced", false, "send even during quiet hours")
+	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
 
-	token, err := loadToken(*envPath)
+	text := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if text == "" {
+		fmt.Fprintln(os.Stderr, "usage: vestaboard send [-env .env] [-forced] <message>")
+		os.Exit(1)
+	}
+
+	token, err := loadEnvVar(*envPath, "VESTABORD_TOKEN")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -118,4 +40,119 @@ func main() {
 	}
 
 	fmt.Printf("sent message (id: %s)\n", result.ID)
+}
+
+func runLTrain(args []string) {
+	fs := flag.NewFlagSet("l", flag.ExitOnError)
+	envPath := fs.String("env", ".env", "path to .env file")
+	forced := fs.Bool("forced", false, "send even during quiet hours")
+	printOnly := fs.Bool("print", false, "print message without sending to Vestaboard")
+	once := fs.Bool("once", false, "update once and exit")
+	interval := fs.Duration("interval", 30*time.Second, "how often to refresh (e.g. 30s, 1m)")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+
+	if *interval < 15*time.Second && !*once {
+		fmt.Fprintln(os.Stderr, "interval must be at least 15s (Vestaboard rate limit)")
+		os.Exit(1)
+	}
+
+	var token string
+	if !*printOnly {
+		var err error
+		token, err = loadEnvVar(*envPath, "VESTABORD_TOKEN")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+
+	update := func() error {
+		now := time.Now()
+		arrivals, err := mta.FetchLArrivals1stAve(now)
+		if err != nil {
+			return err
+		}
+
+		message := mta.FormatBoardMessage(now, arrivals)
+		fmt.Println(message)
+
+		if *printOnly {
+			return nil
+		}
+
+		result, err := sendMessage(token, message, *forced)
+		if err != nil {
+			return err
+		}
+
+		fmt.Printf("sent message (id: %s)\n", result.ID)
+		return nil
+	}
+
+	if *once {
+		if err := update(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	ticker := time.NewTicker(*interval)
+	defer ticker.Stop()
+
+	for {
+		if err := update(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func main() {
+	if len(os.Args) < 2 {
+		runLTrain(nil)
+		return
+	}
+
+	switch os.Args[1] {
+	case "send":
+		runSend(os.Args[2:])
+	case "l":
+		runLTrain(os.Args[2:])
+	case "-h", "--help", "help":
+		printUsage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		printUsage()
+		os.Exit(1)
+	}
+}
+
+func printUsage() {
+	fmt.Fprintf(os.Stderr, `vestaboard - write to a Vestaboard Note
+
+usage:
+  vestaboard                         refresh L train arrivals every 30s
+  vestaboard l [-interval 1m]        same as above
+  vestaboard l -once                 update once and exit
+  vestaboard l -print                preview without sending to board
+  vestaboard send <msg>              send a custom message
+
+flags:
+  -env .env       path to .env file (default: .env)
+  -forced         send during quiet hours
+  -interval 30s   refresh frequency (minimum 15s)
+  -once           update once and exit
+  -print          print times without sending
+`)
 }
